@@ -1,0 +1,313 @@
+---
+title: "Assignment 3"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Learning to target a marketing intervention
+In this assignment, we will combine our knowledge of randomized experimentation, predictive modeling, and learning targeting policies to decide which registered voters to assign to a get-out-the-vote intervention.
+
+```{r, message=FALSE, results='hide'}
+library(glmnet)
+library(dplyr)
+library(Hmisc)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(broom)
+theme_set(theme_bw())
+options(digits = 3)
+```
+
+## The treatment
+This is a ``social pressure'' intervention in which the person receives a mailing showing their own history of voting in recent elections, that of their neighbors, and a comparison with the median voting frequency in their state. We discussed this as an example earlier in class.
+
+This treatment costs approximately $0.80, so we want to use it when it will sufficiently increase someone's chance of voting.
+
+## Outside option
+When deciding whether to spend 80 cents to treat someone, we should have in mind what else we might do with that money. For example, maybe we could instead use this to text message voters? Or call them? Or send door-to-door canvassers. We can make this comparison by looking at dollars-per-incremental-vote for various treatments. Simplifying a bit (but keeping this pretty realistic), we will assume that we have an outside option that on average yields one incremental vote per $150 spent. 
+
+Thus, we can easily compute what sized treatment effect (here the proportion of people, perhaps of some subgroup, is induced to vote by the mailer) is sufficient to decide to spend our money this way:
+```{r}
+mailer.cost = .80
+outside.option.per.vote = 150
+min.effect.to.treat = mailer.cost / outside.option.per.vote
+min.effect.to.treat
+```
+This is just over 0.53 %age points. So we will try to treat only those households where we think the treatment effect is at least 0.005333.
+
+## Data
+You have data from a large field experiment spanning multiple U.S. states conducted for the 2014 midterm elections. This data is available from the Kaggle page.
+
+Let's load the data:
+```{r}
+d = readr::read_csv("turnout_train.csv")
+```
+
+We can see how our data breaks down across states and treatment:
+```{r}
+table(d$state, d$treat)
+```
+The fraction treated varies from state-to-state:
+```{r}
+d %>% group_by(state) %>%
+    summarise(p_treat = mean(treat)) %>%
+    ggplot(aes(x = state, y = p_treat)) +
+    geom_point() +
+    coord_flip()
+```
+
+Note that because this probability of treatment varied from state-to-state, voters are not being randomized to treatment and control with the same probability, so are not necessarily directly comparable across states. You can decide how to address this, but we suggest at least including the `state` variable in your predictive models.
+
+For now we will just create a variable that could be helpful here.
+```{r}
+d = d %>%
+    group_by(state) %>%
+    mutate(
+        p_treat = mean(treat)
+    ) %>% ungroup()
+```
+
+The probability of treatment is always large, reflecting our belief that this intervention works on average. Wait, does it work on average? Let's do a simple analysis of average treatment effects by state.
+
+```{r}
+results_by_state = d %>%
+  group_by(state) %>%
+  do({
+    test = lm(voted_2014 ~ treat, data = .)
+    r = broom::tidy(test, conf.int = TRUE)
+    r$n = nrow(.)
+    r
+  })
+results_by_state %>% filter(term == "treat")
+```
+And then we can plot these estimates and confidence intervals.
+```{r}
+results_by_state %>% filter(term == "treat") %>%
+ggplot(aes(x = state, y = estimate, ymin = conf.low, ymax = conf.high)) +
+    geom_hline(yintercept = 0, alpha = .3) +
+    geom_hline(yintercept = min.effect.to.treat, alpha = .6, color = "blue") +
+    geom_linerange(size = 3, color = "#555555") +
+    geom_point(color = "white", size = 2) +
+    coord_flip()
+```
+Very uncertain estimates in Texas and Arkansas. More like less than 2 %age points elsewhere. Maybe the treatment mainly works for some types of people.
+
+## Evaluation households
+We have a second set of people for which we want to assign treatment.
+
+These people were part of the same field experiment, so we know whether they were treated and whether they voted, which will be used to evaluate your targeting policies (explained further below). 
+
+```{r}
+ta = readr::read_csv("turnout_to_assign.csv")
+```
+
+These come from a subset of the states we have in the training data:
+```{r}
+table(d$state)
+table(ta$state)
+```
+You may want to account for this in some way when making your targeting assignments.
+
+(One way we've made this easier than it would be in practice is that we are also trying to produce turnout in the 2014 election, but, of course, you don't get to observe turnout until after the election. So typically what you actually want to do is either (a) apply what you learned in 2016 and 2018 experiments to 2020 or (b) use other outcomes that can serve as surrogates/proxies for turnout. But a first step for (a) often is finding what would have been best to do in the prior campaign.)
+
+We combine these data sets, making note of which are the ones we need to assign and forming our training set.
+```{r}
+set.seed(72540)
+comb = bind_rows(d, ta) %>%
+    mutate(
+        to.assign = is.na(voted_2014),
+        train = !to.assign & runif(n()) < .8,
+    ) %>% ungroup()
+```
+
+```{r}
+table(comb$to.assign, comb$state)
+```
+
+
+## Modeling to target
+How will we decide who to target with this mailer?
+
+We can predict whether they will vote if in treatment and whether they will vote if not treated. If the difference between these predictions is large enough, then we will treat them.
+
+One simple way to do this is simply by fitting the same predictive model separately to the treatment and control data. That's what we will illustrate here as your starting point.
+
+```{r}
+# model matrix for all data
+mm.1 = sparse.model.matrix(
+   ~ 0 + (voted_2010 + voted_2012) * state,
+  data = comb
+)
+
+# fit model for treated voters
+glmnet.1 = cv.glmnet(
+  mm.1[comb$train & comb$treat == 1,],
+  comb$voted_2014[comb$train & comb$treat == 1],
+  family = "binomial",
+  alpha = 0.1,
+  #lambda = 2^(-6:5), # remove or change this, just included to speed up this demo
+  nfolds = 5
+)
+
+# fit model for control voters
+glmnet.0 = cv.glmnet(
+  mm.1[comb$train & comb$treat == 0,],
+  comb$voted_2014[comb$train & comb$treat == 0],
+  family = "binomial",
+  alpha = 0.1,
+  nfolds = 5
+)
+
+```
+
+You should then do many of the same diagnostics etc. you've done before. We are just going to jump directly to getting predictions from these models. 
+
+
+We get both predictions for all voters:
+```{r}
+comb$y.1.hat = predict(
+  glmnet.1, newx = mm.1,
+  type = "response", s = glmnet.1$lambda.1se
+)[,1]
+
+comb$y.0.hat = predict(
+  glmnet.0, newx = mm.1,
+  type = "response", s = glmnet.0$lambda.1se
+)[,1]
+
+```
+
+Now we can combine those predictions to get an estimated effect per voter and, for convenience, a version net of opportunity cost of using this money for this intervention rather than another:
+```{r}
+comb = comb %>%
+  mutate(
+    effect.hat = y.1.hat - y.0.hat,
+    effect.hat.net = effect.hat - min.effect.to.treat,
+    should.treat = effect.hat.net > 0
+  )
+
+```
+
+What do our predicted treatment effects look like? Let's plot a histogram of our estimates
+
+```{r}
+ggplot(
+    aes(x = effect.hat, fill = should.treat),
+    data = comb
+) +
+    geom_histogram(bins = 100) +
+    geom_vline(xintercept = min.effect.to.treat, color = "blue")
+
+```
+
+As you can see, for many of the voters, we think the treatment effect will be larger than 0.0053.
+
+Note also that there is a lot of discreteness here; that is, there aren't that many unique values. That's because the model we used above is very simple. In fact, if we break this out by state, we can see there are only at most four different predicted treatment effects per state, since within states our only predictors were whether they voted in 2010 and 2012:
+```{r}
+ggplot(
+    aes(x = effect.hat, fill = to.assign),
+    data = comb
+) +
+    facet_wrap( ~ state, scales = "free_y") +
+    geom_histogram(bins = 30) +
+    geom_vline(xintercept = min.effect.to.treat, color = "blue")
+
+```
+
+There are some voters in Kansas we won't target and some we will. Who are they?
+```{r}
+comb %>%
+    filter(!to.assign, state == "KS") %>%
+    group_by(should.treat, voted_2010, voted_2012) %>%
+    summarise(
+        n = n(),
+        voted_2014_p = mean(voted_2014)
+    )
+```
+
+These plots should also remind us that our current model is very simple as it doesn't use many of the variables we have about voters. You'll improve this.
+
+
+## Rolling out your targeting (and uploading to Kaggle)
+
+
+Let's clean up the predictions for this new set of voters and export them.
+
+```{r}
+output = comb %>%
+    ungroup() %>%
+    filter(to.assign) %>%
+    mutate(treat = as.integer(should.treat)) %>%
+    select(id, treat)
+```
+
+Now we can write our targeting choices to a file to upload to Kaggle. This file should just have IDs and binary indicators of whether to treat them.
+```{r}
+readr::write_csv(output, "example_output.csv.gz")
+```
+(Here we have added a '.gz' extension which means that `write_csv` will automatically compress this file, making it faster to upload to Kaggle.)
+
+To really apply this in the wild, the final step would typically be providing a list of voters that we want to treat and passing that to whoever is doing the operations of mailing them.
+
+## Scoring
+We will score your submissions based on how much they increase voting, net of the opportunity costs.
+
+The scores in the leaderboard can range from 0 to 1, with higher being better, though they will be in a much smaller range in practice. A score of 1 means a policy perfectly allocates everyone to the best treatment for them. A score of 0 means a policy perfectly allocates everyone to the worse treatment for them. So differences in these leaderboard scores can be interpreted as relative improvements in getting people into the correct treatments. We are able to compute them for this contest because all of the control outcomes $Y_i(0)$ are synthetic.
+
+However, you do not have both potential outcomes for each unit, so cannot do this kind of evaluation directly. However, there are things you can do to evaluate a policy. 
+
+First, let's think of the case where there is no cost of treatment. Well what does the treatment do on average?
+```{r}
+overall.est = results_by_state %>%
+    filter(state %in% unique(ta$state), term == "treat") %>%
+    ungroup() %>%
+    summarise(estimate = weighted.mean(estimate, n))
+overall.est
+```
+It causes about 0.6% of people to vote. So then that difference is quite large: if the first policy is treating everyone, then the second is a ~50% improvement.
+
+Now if we account for our outside option, where we posit we could turn the same expendature into `r min.effect.to.treat` votes, then on average the treatment only causes `r overall.est$estimate - min.effect.to.treat` of incremental voting over the outside option. Thus, such a difference in scores would be a even large comparative improvement; this is common when a treatment "works" for most people but is costly.
+
+### Implementation (optional technical appendix)
+The comparison above corresponds to comparying the policies of treating everyone and treating no one. You can do similar comparisons for other policies by looking at observations where people happened (at random).
+
+The simplest way to evaluate a policy is simply to look at all the cases where the randomized experiment did the same thing as what your policy says to do. 
+
+```{r}
+comb %>%
+    filter(!to.assign) %>%
+    summarise(
+        value.experiment = mean(voted_2014 - min.effect.to.treat * treat),
+        value.policy = weighted.mean(voted_2014 - min.effect.to.treat * treat, should.treat == treat)
+    )
+```
+Our very simple policy comes out very similar to the policy that created our data (which treated all but a small fraction of people at random). Hopefully you can do better!
+
+This method isn't quite right since it doesn't account for the varying probability of treatment across states. To fix this, you need to weight by the inverse of the probability of a unit getting the treatment it actually got (e.g., 1/.95 or 1/.05).
+
+The recitation notebook for this assignment contains some functions that can help you do this evaluation.
+
+#### Doubly-robust policy evaluation and learning
+An even more sophisticated approach is available that allows combining a model with the data. This uses what are called "doubly robust scores" of the form:
+$$
+\hat{\tau}^{DR}_i = \hat{\mu}_1(X_i) - \hat{\mu}_0(X_i) + \frac{Z_i - \hat{\pi}_0(X_i)}{\hat{\pi}_0(X_i) (1 - \hat{\pi}_0(X_i))} (Y_i - \hat{\mu}_{Z_i}(X_i))
+$$
+where $\pi_0(x) = \Pr(Z_i = 1 | X_i = x)$ is the propensity score (which here is known since this was a randomized experiment) and $\mu_{z}(x) = E[Y_i(z) | X_i = x]$ is the conditional mean of the potential outcomes, which is what we fit models of with the data. The idea is that we take the model's predicted treatment effect $\hat{\mu}_1(X_i) - \hat{\mu}_0(X_i)$ and then add back in that model's residual $Y_i - \hat{\mu}_{Z_i}(X_i)$ for the observed treatment for each unit. We weight these according to the propensity score. These scores have nice theoretical properties such that even if the model for the outcome is incorrect you can still get efficiency gains.
+
+Here is a function that will compute these scores:
+```{r}
+doubly.robust.score = function(mu.1, mu.0, p, z, y) {
+  mu = ifelse(z == 1, mu.1, mu.0)
+  mu.1 - mu.0 + ((z - p) / (p * (1 - p))) * (y - mu)
+}
+```
+You can also explore using these techniques to learn the policy as well. In particular, you can estimate the optimal policy by solving this optimization problem:
+$$
+\hat{\pi} = {argmax}_{\pi \in \Pi} N^{-1} \sum_{i = 1}^N S_i M_i \pi(Z_i | X_i)
+$$
+where $M_i = | \hat{\tau}^{DR}_i |$ and $S_i = \text{sign}(\hat{\tau}^{DR}_i)$ decompose the doubly robust scores (i.e.,  $\hat{\tau}^{DR}_i = S_i M_i$). This decomposition allows you to solve this problem using an ordinary classifier as long as it accepts weights: simply use $S_i$ as the class label and $M_i$ as the weight for that observation. More details can be found in some quite technical papers (e.g., [Athey & Wager 2021](https://www.econometricsociety.org/publications/econometrica/2021/01/01/policy-learning-observational-data)) or courses in statistics or machine learning (e.g., [Counterfactual Machine Learning at Cornell](http://www.cs.cornell.edu/courses/cs7792/2018fa/)), but this is beyond the scope of the course.
+
+
+
